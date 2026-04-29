@@ -24,13 +24,14 @@ model User {
 }
 
 model AccessRequest {
-  id        String  @id
-  name      String
-  email     String
-  team      String?
-  reason    String?
-  status    String  @default("pending")
-  createdAt BigInt  @map("created_at")
+  id           String  @id
+  name         String
+  email        String
+  passwordHash String  @map("password_hash")
+  team         String?
+  reason       String?
+  status       String  @default("pending")
+  createdAt    BigInt  @map("created_at")
 
   @@map("access_requests")
 }

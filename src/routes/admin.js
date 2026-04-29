@@ -1,7 +1,7 @@
 import { Router } from 'express';
-import { randomUUID, randomBytes } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { prisma, now, toNum } from '../db.js';
-import { authenticate, requireAdmin, hashPassword } from '../auth.js';
+import { authenticate, requireAdmin } from '../auth.js';
 
 const r = Router();
 r.use(authenticate, requireAdmin);
@@ -48,13 +48,12 @@ r.post('/requests/:id/approve', async (req, res, next) => {
       });
       return res.json({ ok: true, alreadyMember: true });
     }
-    const tempPassword = randomBytes(6).toString('base64url');
     await prisma.user.create({
       data: {
         id: randomUUID(),
         name: reqRow.name,
         email: reqRow.email.toLowerCase(),
-        passwordHash: hashPassword(tempPassword),
+        passwordHash: reqRow.passwordHash,
         team: reqRow.team,
         role: 'member',
         active: true,
@@ -65,7 +64,7 @@ r.post('/requests/:id/approve', async (req, res, next) => {
       where: { id: reqRow.id },
       data: { status: 'approved' },
     });
-    res.json({ ok: true, tempPassword });
+    res.json({ ok: true });
   } catch (e) { next(e); }
 });
 

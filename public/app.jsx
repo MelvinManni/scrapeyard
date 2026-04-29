@@ -120,14 +120,18 @@ function SignInScreen({ onSignedIn, onRequestAccess, toast }) {
 function RequestAccessScreen({ onBack, toast }) {
   const [submitted, setSubmitted] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [form, setForm] = useState({ name: '', email: '', team: '', reason: '' });
+  const [form, setForm] = useState({ name: '', email: '', password: '', confirm: '', team: '', reason: '' });
   const update = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
   const submit = async () => {
     if (!form.name || !form.email) return toast('name and email required', 'error');
+    if (!form.password) return toast('password required', 'error');
+    if (form.password.length < 8) return toast('password must be at least 8 characters', 'error');
+    if (form.password !== form.confirm) return toast('passwords do not match', 'error');
     setBusy(true);
     try {
-      await api.post('/auth/request-access', form);
+      const { confirm, ...payload } = form;
+      await api.post('/auth/request-access', payload);
       setSubmitted(true);
     } catch (e) {
       toast(e.message, 'error');
@@ -164,6 +168,15 @@ function RequestAccessScreen({ onBack, toast }) {
               <label className="field-label">Work email</label>
               <input className="input" value={form.email} onChange={update('email')} placeholder="you@acme.io" type="email" />
               <span className="field-help">Must match an approved company domain.</span>
+            </div>
+            <div className="field">
+              <label className="field-label">Password</label>
+              <input className="input" value={form.password} onChange={update('password')} placeholder="At least 8 characters" type="password" autoComplete="new-password" />
+              <span className="field-help">You'll use this to sign in once approved.</span>
+            </div>
+            <div className="field">
+              <label className="field-label">Confirm password</label>
+              <input className="input" value={form.confirm} onChange={update('confirm')} placeholder="Re-enter password" type="password" autoComplete="new-password" />
             </div>
             <div className="field">
               <label className="field-label">Team</label>

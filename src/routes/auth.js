@@ -37,14 +37,20 @@ r.get('/me', authenticate, (req, res) => {
 
 r.post('/request-access', async (req, res, next) => {
   try {
-    const { name, email, team, reason } = req.body || {};
-    if (!name || !email) return res.status(400).json({ error: 'name and email required' });
+    const { name, email, password, team, reason } = req.body || {};
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: 'name, email, and password required' });
+    }
+    if (String(password).length < 8) {
+      return res.status(400).json({ error: 'password must be at least 8 characters' });
+    }
     const id = randomUUID();
     await prisma.accessRequest.create({
       data: {
         id,
         name,
         email: String(email).toLowerCase(),
+        passwordHash: hashPassword(password),
         team: team || null,
         reason: reason || null,
         status: 'pending',

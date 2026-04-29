@@ -1,0 +1,97 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+}
+
+model User {
+  id            String   @id
+  name          String
+  email         String   @unique
+  passwordHash  String   @map("password_hash")
+  team          String?
+  role          String   @default("member")
+  active        Boolean  @default(true)
+  createdAt     BigInt   @map("created_at")
+  lastActiveAt  BigInt?  @map("last_active_at")
+
+  jobs          Job[]
+
+  @@map("users")
+}
+
+model AccessRequest {
+  id        String  @id
+  name      String
+  email     String
+  team      String?
+  reason    String?
+  status    String  @default("pending")
+  createdAt BigInt  @map("created_at")
+
+  @@map("access_requests")
+}
+
+model Job {
+  id            String   @id
+  ownerId       String   @map("owner_id")
+  name          String
+  keywordsJson  String   @map("keywords_json")
+  cron          String
+  filterPrompt  String?  @map("filter_prompt")
+  status        String   @default("running")
+  lastRunAt     BigInt?  @map("last_run_at")
+  nextRunAt     BigInt?  @map("next_run_at")
+  lastError     String?  @map("last_error")
+  createdAt     BigInt   @map("created_at")
+
+  owner   User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  runs    Run[]
+  results Result[]
+
+  @@index([ownerId])
+  @@map("jobs")
+}
+
+model Run {
+  id           String  @id
+  jobId        String  @map("job_id")
+  startedAt    BigInt  @map("started_at")
+  finishedAt   BigInt? @map("finished_at")
+  status       String
+  resultsCount Int     @default(0) @map("results_count")
+  durationMs   Int?    @map("duration_ms")
+  error        String?
+
+  job     Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  results Result[]
+
+  @@index([jobId, startedAt(sort: Desc)])
+  @@map("runs")
+}
+
+model Result {
+  id          String  @id
+  jobId       String  @map("job_id")
+  runId       String? @map("run_id")
+  source      String?
+  title       String
+  url         String
+  snippet     String?
+  imageUrl    String? @map("image_url")
+  tag         String?
+  publishedAt BigInt? @map("published_at")
+  fetchedAt   BigInt  @map("fetched_at")
+  hidden      Boolean @default(false)
+  urlHash     String  @map("url_hash")
+
+  job Job  @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  run Run? @relation(fields: [runId], references: [id], onDelete: SetNull)
+
+  @@unique([jobId, urlHash])
+  @@index([jobId, fetchedAt(sort: Desc)])
+  @@map("results")
+}

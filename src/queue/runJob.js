@@ -1,73 +1,99 @@
 import { randomUUID } from 'node:crypto';
-import { db, now } from '../db.js';
+import { prisma, now } from '../db.js';
 import { runScrape } from '../scraper/index.js';
 import { applyFilter } from '../filter.js';
 
 export async function runJob(jobId) {
-  const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId);
+  const job = await prisma.job.findUnique({ where: { id: jobId } });
   if (!job) throw new Error(`job ${jobId} not found`);
   if (job.status === 'paused') return { skipped: true };
 
   const runId = randomUUID();
   const startedAt = now();
-  db.prepare(`
-    INSERT INTO runs (id, job_id, started_at, status) VALUES (?, ?, ?, 'running')
-  `).run(runId, job.id, startedAt);
+  await prisma.run.create({
+    data: {
+      id: runId,
+      jobId: job.id,
+      startedAt: BigInt(startedAt),
+      status: 'running',
+    },
+  });
 
   try {
-    const keywords = JSON.parse(job.keywords_json);
+    const keywords = JSON.parse(job.keywordsJson);
     const { items, errors } = await runScrape({ keywords });
 
     // Apply the configured filter only when an LLM is available — heuristic
     // filtering at scrape time is too risky (we'd drop data we can't recover).
     // Without LLM, we store everything and let the view-time filter handle it.
     let kept = items;
-    if (job.filter_prompt && process.env.ANTHROPIC_API_KEY) {
-      const out = await applyFilter({ prompt: job.filter_prompt, items });
+    if (job.filterPrompt && process.env.ANTHROPIC_API_KEY) {
+      const out = await applyFilter({ prompt: job.filterPrompt, items });
       kept = out.items;
     }
 
-    const insert = db.prepare(`
-      INSERT OR IGNORE INTO results
-        (id, job_id, run_id, source, title, url, snippet, image_url, tag, published_at, fetched_at, url_hash)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
     const fetchedAt = now();
     let inserted = 0;
-    const tx = db.transaction((rows) => {
-      for (const r of rows) {
-        const info = insert.run(
-          randomUUID(), job.id, runId,
-          r.source, r.title, r.url, r.snippet, r.image_url || null,
-          r.tag || null, r.published_at || null, fetchedAt, r.url_hash
-        );
-        if (info.changes) inserted++;
-      }
-    });
-    tx(kept);
+    if (kept.length) {
+      const created = await prisma.result.createMany({
+        data: kept.map(r => ({
+          id: randomUUID(),
+          jobId: job.id,
+          runId,
+          source: r.source,
+          title: r.title,
+          url: r.url,
+          snippet: r.snippet,
+          imageUrl: r.image_url || null,
+          tag: r.tag || null,
+          publishedAt: r.published_at ? BigInt(r.published_at) : null,
+          fetchedAt: BigInt(fetchedAt),
+          urlHash: r.url_hash,
+        })),
+        skipDuplicates: true,
+      });
+      inserted = created.count;
+    }
 
     const finishedAt = now();
     const status = errors.length && !inserted ? 'error' : 'ok';
-    db.prepare(`
-      UPDATE runs SET finished_at = ?, status = ?, results_count = ?, duration_ms = ?, error = ?
-      WHERE id = ?
-    `).run(finishedAt, status, inserted, finishedAt - startedAt,
-           errors.length ? JSON.stringify(errors) : null, runId);
+    await prisma.run.update({
+      where: { id: runId },
+      data: {
+        finishedAt: BigInt(finishedAt),
+        status,
+        resultsCount: inserted,
+        durationMs: finishedAt - startedAt,
+        error: errors.length ? JSON.stringify(errors) : null,
+      },
+    });
 
-    db.prepare(`
-      UPDATE jobs SET last_run_at = ?, last_error = ?, status = CASE WHEN status = 'error' THEN 'running' ELSE status END
-      WHERE id = ?
-    `).run(finishedAt, errors.length ? JSON.stringify(errors) : null, job.id);
+    await prisma.job.update({
+      where: { id: job.id },
+      data: {
+        lastRunAt: BigInt(finishedAt),
+        lastError: errors.length ? JSON.stringify(errors) : null,
+        // Recover from a previous 'error' status; leave 'paused' alone.
+        ...(job.status === 'error' ? { status: 'running' } : {}),
+      },
+    });
 
     return { runId, inserted, total: kept.length, errors };
   } catch (err) {
     const finishedAt = now();
-    db.prepare(`
-      UPDATE runs SET finished_at = ?, status = 'error', error = ?, duration_ms = ?
-      WHERE id = ?
-    `).run(finishedAt, String(err.message || err), finishedAt - startedAt, runId);
-    db.prepare(`UPDATE jobs SET status = 'error', last_error = ? WHERE id = ?`)
-      .run(String(err.message || err), job.id);
+    await prisma.run.update({
+      where: { id: runId },
+      data: {
+        finishedAt: BigInt(finishedAt),
+        status: 'error',
+        error: String(err.message || err),
+        durationMs: finishedAt - startedAt,
+      },
+    });
+    await prisma.job.update({
+      where: { id: job.id },
+      data: { status: 'error', lastError: String(err.message || err) },
+    });
     throw err;
   }
 }

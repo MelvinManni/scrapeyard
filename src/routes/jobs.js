@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { randomUUID } from 'node:crypto';
-import { db, now } from '../db.js';
+import { Prisma } from '@prisma/client';
+import { prisma, now, toNum } from '../db.js';
 import { authenticate } from '../auth.js';
 import { scheduleJob, unscheduleJob, enqueueRunNow } from '../queue/scheduler.js';
 import { applyFilter } from '../filter.js';
@@ -12,7 +13,7 @@ const VALID_CRON = new Set(['hourly', 'daily', 'weekly', 'manual']);
 
 function relTime(t) {
   if (!t) return null;
-  const diff = Date.now() - t;
+  const diff = Date.now() - Number(t);
   const m = Math.round(diff / 60000);
   if (m < 1) return 'now';
   if (m < 60) return `${m}m ago`;
@@ -24,7 +25,7 @@ function relTime(t) {
 
 function relUntil(t) {
   if (!t) return null;
-  const diff = t - Date.now();
+  const diff = Number(t) - Date.now();
   if (diff <= 0) return 'soon';
   const m = Math.round(diff / 60000);
   if (m < 60) return `in ${m}m`;
@@ -43,97 +44,127 @@ function cronLabel(c) {
   })[c] || c;
 }
 
-function shapeJob(j) {
-  const resultsCount = db.prepare(
-    'SELECT COUNT(*) as c FROM results WHERE job_id = ? AND hidden = 0'
-  ).get(j.id).c;
+async function shapeJob(j) {
+  const resultsCount = await prisma.result.count({
+    where: { jobId: j.id, hidden: false },
+  });
   return {
     id: j.id,
     name: j.name,
-    keywords: JSON.parse(j.keywords_json),
+    keywords: JSON.parse(j.keywordsJson),
     cron: j.cron,
     cronLabel: cronLabel(j.cron),
     status: j.status,
-    filterPrompt: j.filter_prompt || '',
-    lastRun: j.last_run_at ? relTime(j.last_run_at) : 'never',
-    nextRun: j.status === 'paused' ? 'paused' : (j.next_run_at ? relUntil(j.next_run_at) : 'manual'),
+    filterPrompt: j.filterPrompt || '',
+    lastRun: j.lastRunAt ? relTime(toNum(j.lastRunAt)) : 'never',
+    nextRun: j.status === 'paused'
+      ? 'paused'
+      : (j.nextRunAt ? relUntil(toNum(j.nextRunAt)) : 'manual'),
     results: resultsCount,
-    lastError: j.last_error || null,
-    ownerId: j.owner_id,
-    createdAt: j.created_at,
+    lastError: j.lastError || null,
+    ownerId: j.ownerId,
+    createdAt: toNum(j.createdAt),
   };
 }
 
-r.get('/', (req, res) => {
-  const rows = db.prepare(
-    `SELECT * FROM jobs WHERE owner_id = ? ORDER BY created_at DESC`
-  ).all(req.user.id);
-  res.json({ jobs: rows.map(shapeJob) });
-});
-
-r.post('/', async (req, res) => {
-  const { name, keywords, cron, filterPrompt } = req.body || {};
-  if (!name || !Array.isArray(keywords) || !keywords.length) {
-    return res.status(400).json({ error: 'name and keywords required' });
-  }
-  if (!VALID_CRON.has(cron)) return res.status(400).json({ error: 'invalid cron preset' });
-
-  const id = randomUUID();
-  db.prepare(`
-    INSERT INTO jobs (id, owner_id, name, keywords_json, cron, filter_prompt, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, 'running', ?)
-  `).run(id, req.user.id, name.trim(), JSON.stringify(keywords), cron, filterPrompt || null, now());
-
-  await scheduleJob(id, cron);
-  const j = db.prepare('SELECT * FROM jobs WHERE id = ?').get(id);
-  res.status(201).json({ job: shapeJob(j) });
-});
-
-r.get('/:id', (req, res) => {
-  const j = db.prepare('SELECT * FROM jobs WHERE id = ? AND owner_id = ?').get(req.params.id, req.user.id);
-  if (!j) return res.status(404).json({ error: 'not found' });
-  res.json({ job: shapeJob(j) });
-});
-
-r.patch('/:id', async (req, res) => {
-  const j = db.prepare('SELECT * FROM jobs WHERE id = ? AND owner_id = ?').get(req.params.id, req.user.id);
-  if (!j) return res.status(404).json({ error: 'not found' });
-
-  const fields = {};
-  if (typeof req.body.name === 'string') fields.name = req.body.name.trim();
-  if (Array.isArray(req.body.keywords)) fields.keywords_json = JSON.stringify(req.body.keywords);
-  if (typeof req.body.filterPrompt === 'string') fields.filter_prompt = req.body.filterPrompt;
-  if (typeof req.body.cron === 'string') {
-    if (!VALID_CRON.has(req.body.cron)) return res.status(400).json({ error: 'invalid cron preset' });
-    fields.cron = req.body.cron;
-  }
-  if (req.body.status === 'paused' || req.body.status === 'running') fields.status = req.body.status;
-
-  const keys = Object.keys(fields);
-  if (keys.length) {
-    const setSql = keys.map(k => `${k} = ?`).join(', ');
-    db.prepare(`UPDATE jobs SET ${setSql} WHERE id = ?`).run(...keys.map(k => fields[k]), j.id);
-  }
-  const updated = db.prepare('SELECT * FROM jobs WHERE id = ?').get(j.id);
-  if (fields.cron || fields.status) {
-    if (updated.status === 'paused') await unscheduleJob(j.id);
-    else await scheduleJob(j.id, updated.cron);
-  }
-  res.json({ job: shapeJob(updated) });
-});
-
-r.delete('/:id', async (req, res) => {
-  const j = db.prepare('SELECT id FROM jobs WHERE id = ? AND owner_id = ?').get(req.params.id, req.user.id);
-  if (!j) return res.status(404).json({ error: 'not found' });
-  await unscheduleJob(j.id);
-  db.prepare('DELETE FROM jobs WHERE id = ?').run(j.id);
-  res.json({ ok: true });
-});
-
-r.post('/:id/run', async (req, res) => {
-  const j = db.prepare('SELECT id FROM jobs WHERE id = ? AND owner_id = ?').get(req.params.id, req.user.id);
-  if (!j) return res.status(404).json({ error: 'not found' });
+r.get('/', async (req, res, next) => {
   try {
+    const rows = await prisma.job.findMany({
+      where: { ownerId: req.user.id },
+      orderBy: { createdAt: 'desc' },
+    });
+    const jobs = await Promise.all(rows.map(shapeJob));
+    res.json({ jobs });
+  } catch (e) { next(e); }
+});
+
+r.post('/', async (req, res, next) => {
+  try {
+    const { name, keywords, cron, filterPrompt } = req.body || {};
+    if (!name || !Array.isArray(keywords) || !keywords.length) {
+      return res.status(400).json({ error: 'name and keywords required' });
+    }
+    if (!VALID_CRON.has(cron)) return res.status(400).json({ error: 'invalid cron preset' });
+
+    const id = randomUUID();
+    await prisma.job.create({
+      data: {
+        id,
+        ownerId: req.user.id,
+        name: name.trim(),
+        keywordsJson: JSON.stringify(keywords),
+        cron,
+        filterPrompt: filterPrompt || null,
+        status: 'running',
+        createdAt: BigInt(now()),
+      },
+    });
+
+    await scheduleJob(id, cron);
+    const j = await prisma.job.findUnique({ where: { id } });
+    res.status(201).json({ job: await shapeJob(j) });
+  } catch (e) { next(e); }
+});
+
+r.get('/:id', async (req, res, next) => {
+  try {
+    const j = await prisma.job.findFirst({
+      where: { id: req.params.id, ownerId: req.user.id },
+    });
+    if (!j) return res.status(404).json({ error: 'not found' });
+    res.json({ job: await shapeJob(j) });
+  } catch (e) { next(e); }
+});
+
+r.patch('/:id', async (req, res, next) => {
+  try {
+    const j = await prisma.job.findFirst({
+      where: { id: req.params.id, ownerId: req.user.id },
+    });
+    if (!j) return res.status(404).json({ error: 'not found' });
+
+    const data = {};
+    if (typeof req.body.name === 'string') data.name = req.body.name.trim();
+    if (Array.isArray(req.body.keywords)) data.keywordsJson = JSON.stringify(req.body.keywords);
+    if (typeof req.body.filterPrompt === 'string') data.filterPrompt = req.body.filterPrompt;
+    if (typeof req.body.cron === 'string') {
+      if (!VALID_CRON.has(req.body.cron)) return res.status(400).json({ error: 'invalid cron preset' });
+      data.cron = req.body.cron;
+    }
+    if (req.body.status === 'paused' || req.body.status === 'running') data.status = req.body.status;
+
+    if (Object.keys(data).length) {
+      await prisma.job.update({ where: { id: j.id }, data });
+    }
+    const updated = await prisma.job.findUnique({ where: { id: j.id } });
+    if (data.cron || data.status) {
+      if (updated.status === 'paused') await unscheduleJob(j.id);
+      else await scheduleJob(j.id, updated.cron);
+    }
+    res.json({ job: await shapeJob(updated) });
+  } catch (e) { next(e); }
+});
+
+r.delete('/:id', async (req, res, next) => {
+  try {
+    const j = await prisma.job.findFirst({
+      where: { id: req.params.id, ownerId: req.user.id },
+      select: { id: true },
+    });
+    if (!j) return res.status(404).json({ error: 'not found' });
+    await unscheduleJob(j.id);
+    await prisma.job.delete({ where: { id: j.id } });
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+r.post('/:id/run', async (req, res, next) => {
+  try {
+    const j = await prisma.job.findFirst({
+      where: { id: req.params.id, ownerId: req.user.id },
+      select: { id: true },
+    });
+    if (!j) return res.status(404).json({ error: 'not found' });
     const out = await enqueueRunNow(j.id);
     res.json({ ok: true, ...out });
   } catch (e) {
@@ -141,76 +172,107 @@ r.post('/:id/run', async (req, res) => {
   }
 });
 
-r.get('/:id/results', (req, res) => {
-  const j = db.prepare('SELECT id, name, cron, filter_prompt, status, last_run_at, next_run_at, keywords_json FROM jobs WHERE id = ? AND owner_id = ?')
-    .get(req.params.id, req.user.id);
-  if (!j) return res.status(404).json({ error: 'not found' });
-  const rows = db.prepare(
-    `SELECT * FROM results WHERE job_id = ? AND hidden = 0 ORDER BY COALESCE(published_at, fetched_at) DESC LIMIT 200`
-  ).all(j.id);
+r.get('/:id/results', async (req, res, next) => {
+  try {
+    const j = await prisma.job.findFirst({
+      where: { id: req.params.id, ownerId: req.user.id },
+    });
+    if (!j) return res.status(404).json({ error: 'not found' });
 
-  res.json({
-    job: {
-      id: j.id, name: j.name, cron: j.cron, cronLabel: cronLabel(j.cron),
-      filterPrompt: j.filter_prompt || '', status: j.status,
-      keywords: JSON.parse(j.keywords_json),
-      lastRun: j.last_run_at ? relTime(j.last_run_at) : 'never',
-      nextRun: j.status === 'paused' ? 'paused' : (j.next_run_at ? relUntil(j.next_run_at) : 'manual'),
-    },
-    results: rows.map(r => ({
-      id: r.id,
-      source: r.source,
-      title: r.title,
-      url: r.url,
-      snippet: r.snippet,
-      image: r.image_url,
-      tag: r.tag,
-      time: relTime(r.published_at || r.fetched_at),
-      publishedAt: r.published_at,
-    })),
-  });
+    // Order by COALESCE(published_at, fetched_at) — Prisma can't express this,
+    // so use raw SQL with the actual table/column names.
+    const rows = await prisma.$queryRaw`
+      SELECT id, source, title, url, snippet, image_url, tag, published_at, fetched_at
+      FROM results
+      WHERE job_id = ${j.id} AND hidden = false
+      ORDER BY COALESCE(published_at, fetched_at) DESC
+      LIMIT 200
+    `;
+
+    res.json({
+      job: {
+        id: j.id, name: j.name, cron: j.cron, cronLabel: cronLabel(j.cron),
+        filterPrompt: j.filterPrompt || '', status: j.status,
+        keywords: JSON.parse(j.keywordsJson),
+        lastRun: j.lastRunAt ? relTime(toNum(j.lastRunAt)) : 'never',
+        nextRun: j.status === 'paused'
+          ? 'paused'
+          : (j.nextRunAt ? relUntil(toNum(j.nextRunAt)) : 'manual'),
+      },
+      results: rows.map(r => ({
+        id: r.id,
+        source: r.source,
+        title: r.title,
+        url: r.url,
+        snippet: r.snippet,
+        image: r.image_url,
+        tag: r.tag,
+        time: relTime(toNum(r.published_at) || toNum(r.fetched_at)),
+        publishedAt: r.published_at == null ? null : toNum(r.published_at),
+      })),
+    });
+  } catch (e) { next(e); }
 });
 
-r.post('/:id/filter', async (req, res) => {
-  const j = db.prepare('SELECT id FROM jobs WHERE id = ? AND owner_id = ?').get(req.params.id, req.user.id);
-  if (!j) return res.status(404).json({ error: 'not found' });
-  const prompt = (req.body?.prompt || '').toString();
-  const rows = db.prepare(
-    `SELECT * FROM results WHERE job_id = ? AND hidden = 0 ORDER BY COALESCE(published_at, fetched_at) DESC LIMIT 200`
-  ).all(j.id);
+r.post('/:id/filter', async (req, res, next) => {
+  try {
+    const j = await prisma.job.findFirst({
+      where: { id: req.params.id, ownerId: req.user.id },
+      select: { id: true },
+    });
+    if (!j) return res.status(404).json({ error: 'not found' });
+    const prompt = (req.body?.prompt || '').toString();
+    const rows = await prisma.$queryRaw`
+      SELECT id, source, title, url, snippet, image_url, tag, published_at, fetched_at
+      FROM results
+      WHERE job_id = ${j.id} AND hidden = false
+      ORDER BY COALESCE(published_at, fetched_at) DESC
+      LIMIT 200
+    `;
 
-  const items = rows.map(r => ({
-    id: r.id, source: r.source, title: r.title, url: r.url,
-    snippet: r.snippet, image: r.image_url, tag: r.tag,
-    publishedAt: r.published_at,
-  }));
+    const items = rows.map(r => ({
+      id: r.id, source: r.source, title: r.title, url: r.url,
+      snippet: r.snippet, image: r.image_url, tag: r.tag,
+      publishedAt: r.published_at == null ? null : toNum(r.published_at),
+    }));
 
-  const out = await applyFilter({ prompt, items });
-  const shaped = out.items.map(it => ({
-    ...it,
-    time: relTime(it.publishedAt || Date.now()),
-  }));
-  res.json({ results: shaped, mode: out.mode, prompt });
+    const out = await applyFilter({ prompt, items });
+    const shaped = out.items.map(it => ({
+      ...it,
+      time: relTime(it.publishedAt || Date.now()),
+    }));
+    res.json({ results: shaped, mode: out.mode, prompt });
+  } catch (e) { next(e); }
 });
 
-r.get('/:id/runs', (req, res) => {
-  const j = db.prepare('SELECT id FROM jobs WHERE id = ? AND owner_id = ?').get(req.params.id, req.user.id);
-  if (!j) return res.status(404).json({ error: 'not found' });
-  const runs = db.prepare(
-    `SELECT id, started_at, finished_at, status, results_count, duration_ms, error FROM runs
-     WHERE job_id = ? ORDER BY started_at DESC LIMIT 20`
-  ).all(j.id);
-  res.json({
-    runs: runs.map(r => ({
-      id: r.id,
-      startedAt: r.started_at,
-      time: relTime(r.started_at),
-      duration: r.duration_ms ? `${(r.duration_ms / 1000).toFixed(1)}s` : '—',
-      count: r.results_count,
-      status: r.status,
-      error: r.error,
-    })),
-  });
+r.get('/:id/runs', async (req, res, next) => {
+  try {
+    const j = await prisma.job.findFirst({
+      where: { id: req.params.id, ownerId: req.user.id },
+      select: { id: true },
+    });
+    if (!j) return res.status(404).json({ error: 'not found' });
+    const runs = await prisma.run.findMany({
+      where: { jobId: j.id },
+      orderBy: { startedAt: 'desc' },
+      take: 20,
+      select: {
+        id: true, startedAt: true, finishedAt: true, status: true,
+        resultsCount: true, durationMs: true, error: true,
+      },
+    });
+    res.json({
+      runs: runs.map(r => ({
+        id: r.id,
+        startedAt: toNum(r.startedAt),
+        time: relTime(toNum(r.startedAt)),
+        duration: r.durationMs ? `${(r.durationMs / 1000).toFixed(1)}s` : '—',
+        count: r.resultsCount,
+        status: r.status,
+        error: r.error,
+      })),
+    });
+  } catch (e) { next(e); }
 });
 
 export default r;

@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path';
 
 import { ensureAdmin } from './auth.js';
 import { initScheduler, isUsingBull } from './queue/scheduler.js';
+import { prisma } from './db.js';
 
 import authRoutes from './routes/auth.js';
 import jobsRoutes from './routes/jobs.js';
@@ -39,9 +40,22 @@ app.get(/^\/(?!api\/).*/, (req, res) => {
 });
 
 (async () => {
-  ensureAdmin();
-  await initScheduler();
-  app.listen(PORT, () => {
-    console.log(`Scrape Yard listening on http://localhost:${PORT}`);
-  });
+  try {
+    await prisma.$connect();
+    await ensureAdmin();
+    await initScheduler();
+    app.listen(PORT, () => {
+      console.log(`Scrape Yard listening on http://localhost:${PORT}`);
+    });
+  } catch (err) {
+    console.error('[startup] failed:', err);
+    process.exit(1);
+  }
 })();
+
+const shutdown = async () => {
+  try { await prisma.$disconnect(); } catch {}
+  process.exit(0);
+};
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

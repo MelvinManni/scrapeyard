@@ -1,4 +1,4 @@
-import { db, now } from '../db.js';
+import { prisma, now } from '../db.js';
 import { runJob, CRON_EXPR, nextRunFromCron } from './runJob.js';
 
 let bullQueue = null;
@@ -36,7 +36,7 @@ async function setupBull() {
 export async function initScheduler() {
   await setupBull();
   // (Re-)schedule everything currently in DB.
-  const jobs = db.prepare(`SELECT id, cron, status FROM jobs`).all();
+  const jobs = await prisma.job.findMany({ select: { id: true, cron: true, status: true } });
   for (const j of jobs) {
     if (j.status === 'paused') continue;
     await scheduleJob(j.id, j.cron);
@@ -46,11 +46,11 @@ export async function initScheduler() {
 export async function scheduleJob(jobId, cronPreset) {
   await unscheduleJob(jobId);
   if (cronPreset === 'manual') {
-    db.prepare('UPDATE jobs SET next_run_at = NULL WHERE id = ?').run(jobId);
+    await prisma.job.update({ where: { id: jobId }, data: { nextRunAt: null } });
     return;
   }
   const next = nextRunFromCron(cronPreset);
-  db.prepare('UPDATE jobs SET next_run_at = ? WHERE id = ?').run(next, jobId);
+  await prisma.job.update({ where: { id: jobId }, data: { nextRunAt: BigInt(next) } });
 
   if (usingBull) {
     const expr = CRON_EXPR[cronPreset];
@@ -67,21 +67,24 @@ export async function scheduleJob(jobId, cronPreset) {
       );
     }
   } else {
-    armInMemory(jobId, cronPreset);
+    await armInMemory(jobId, cronPreset);
   }
 }
 
-function armInMemory(jobId, cronPreset) {
+async function armInMemory(jobId, cronPreset) {
   const tick = async () => {
     inMemoryTimers.delete(jobId);
     try { await runJob(jobId); }
     catch (e) { console.error(`[scheduler] ${jobId} failed:`, e.message); }
     // re-arm if still scheduled
-    const j = db.prepare('SELECT cron, status FROM jobs WHERE id = ?').get(jobId);
-    if (j && j.status !== 'paused' && j.cron !== 'manual') armInMemory(jobId, j.cron);
+    const j = await prisma.job.findUnique({
+      where: { id: jobId },
+      select: { cron: true, status: true },
+    });
+    if (j && j.status !== 'paused' && j.cron !== 'manual') await armInMemory(jobId, j.cron);
   };
   const next = nextRunFromCron(cronPreset);
-  db.prepare('UPDATE jobs SET next_run_at = ? WHERE id = ?').run(next, jobId);
+  await prisma.job.update({ where: { id: jobId }, data: { nextRunAt: BigInt(next) } });
   const delay = Math.max(1000, next - now());
   const t = setTimeout(tick, delay);
   inMemoryTimers.set(jobId, t);

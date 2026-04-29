@@ -1,7 +1,7 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { randomUUID } from 'node:crypto';
-import { db, now } from './db.js';
+import { prisma, now } from './db.js';
 
 const SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const SESSION_DAYS = parseInt(process.env.SESSION_DAYS || '14', 10);
@@ -27,16 +27,24 @@ export function verifyToken(token) {
   catch { return null; }
 }
 
-export function ensureAdmin() {
-  const count = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
+export async function ensureAdmin() {
+  const count = await prisma.user.count();
   if (count > 0) return;
   const email = process.env.ADMIN_EMAIL || 'admin@acme.io';
   const password = process.env.ADMIN_PASSWORD || 'admin';
   const name = process.env.ADMIN_NAME || 'Admin';
-  db.prepare(`
-    INSERT INTO users (id, name, email, password_hash, team, role, active, created_at)
-    VALUES (?, ?, ?, ?, ?, 'admin', 1, ?)
-  `).run(randomUUID(), name, email.toLowerCase(), hashPassword(password), 'Engineering', now());
+  await prisma.user.create({
+    data: {
+      id: randomUUID(),
+      name,
+      email: email.toLowerCase(),
+      passwordHash: hashPassword(password),
+      team: 'Engineering',
+      role: 'admin',
+      active: true,
+      createdAt: BigInt(now()),
+    },
+  });
   console.log(`[auth] seeded admin: ${email} / ${password}`);
 }
 
@@ -46,15 +54,23 @@ function readToken(req) {
   return req.cookies?.sy_token || null;
 }
 
-export function authenticate(req, res, next) {
-  const token = readToken(req);
-  const claims = token ? verifyToken(token) : null;
-  if (!claims) return res.status(401).json({ error: 'unauthenticated' });
-  const user = db.prepare('SELECT id, name, email, team, role, active FROM users WHERE id = ?').get(claims.sub);
-  if (!user || !user.active) return res.status(401).json({ error: 'unauthenticated' });
-  db.prepare('UPDATE users SET last_active_at = ? WHERE id = ?').run(now(), user.id);
-  req.user = user;
-  next();
+export async function authenticate(req, res, next) {
+  try {
+    const token = readToken(req);
+    const claims = token ? verifyToken(token) : null;
+    if (!claims) return res.status(401).json({ error: 'unauthenticated' });
+    const user = await prisma.user.findUnique({
+      where: { id: claims.sub },
+      select: { id: true, name: true, email: true, team: true, role: true, active: true },
+    });
+    if (!user || !user.active) return res.status(401).json({ error: 'unauthenticated' });
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { lastActiveAt: BigInt(now()) },
+    });
+    req.user = user;
+    next();
+  } catch (e) { next(e); }
 }
 
 export function requireAdmin(req, res, next) {

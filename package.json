@@ -5,17 +5,18 @@
   "type": "module",
   "main": "src/server.js",
   "scripts": {
-    "start": "node src/server.js",
+    "start": "prisma migrate deploy && node src/server.js",
     "dev": "node --watch src/server.js",
     "worker": "node src/queue/worker.js",
-    "all": "node src/server.js"
+    "all": "node src/server.js",
+    "postinstall": "prisma generate"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
+    "@prisma/client": "^5.22.0",
     "bcryptjs": "^2.4.3",
-    "better-sqlite3": "^11.3.0",
     "bullmq": "^5.21.2",
     "cheerio": "^1.0.0",
     "cookie-parser": "^1.4.7",
@@ -26,5 +27,8 @@
     "jsonwebtoken": "^9.0.2",
     "playwright": "^1.48.2",
     "undici": "^6.20.1"
+  },
+  "devDependencies": {
+    "prisma": "^5.22.0"
   }
 }

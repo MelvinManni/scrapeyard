@@ -197,7 +197,7 @@ r.get('/:id/runs', (req, res) => {
   const j = db.prepare('SELECT id FROM jobs WHERE id = ? AND owner_id = ?').get(req.params.id, req.user.id);
   if (!j) return res.status(404).json({ error: 'not found' });
   const runs = db.prepare(
-    `SELECT id, started_at, finished_at, status, results_count, duration_ms FROM runs
+    `SELECT id, started_at, finished_at, status, results_count, duration_ms, error FROM runs
      WHERE job_id = ? ORDER BY started_at DESC LIMIT 20`
   ).all(j.id);
   res.json({
@@ -208,6 +208,7 @@ r.get('/:id/runs', (req, res) => {
       duration: r.duration_ms ? `${(r.duration_ms / 1000).toFixed(1)}s` : '—',
       count: r.results_count,
       status: r.status,
+      error: r.error,
     })),
   });
 });
